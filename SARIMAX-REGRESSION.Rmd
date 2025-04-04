@@ -36,14 +36,18 @@ University of Toronto\\[2em]
 knitr::opts_chunk$set(echo = FALSE, fig.align = "center", out.width = "70%")
 ```
 
-```{r, echo=FALSE}
-### SARIMAX 
-# Load required libraries
+
+```{r, echo=FALSE, include=FALSE}
 library(dplyr)
 library(lubridate)
 library(forecast)  
 library(ggplot2)
-library(tidyverse)
+library(tidyverse) 
+
+```
+
+```{r, echo=FALSE}
+### SARIMAX 
 
 ### Load and Aggregate Cocoa Price Data
 cocoa_prices <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE) %>%
@@ -96,7 +100,7 @@ sarimax_model <- auto.arima(
   seasonal = TRUE,
   stepwise = FALSE,  # More thorough search (set to TRUE for faster results)
   approximation = FALSE,
-  trace = TRUE  # Show model search progress
+  trace = FALSE  # Show model search progress
 )
 
 
