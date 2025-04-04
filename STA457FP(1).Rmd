@@ -1,0 +1,608 @@
+---
+title: "STA457FP"
+author: "Quansheng (George) Guo"
+date: "2025-03-28"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    extra_dependencies:
+      ctexcap: UTF8
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+options(repos = c(CRAN = "https://cran.r-project.org"))
+library(data.table)
+library(lubridate)
+library(zoo)
+library(xgboost)
+library(Metrics)
+library(ggplot2)
+library(fastDummies)
+library(knitr)
+library(kableExtra)
+```
+
+```{r, include=FALSE}
+# 读取数据
+price_data <- fread("Daily Prices_ICCO.csv", sep=",")
+# 重命名方便引用
+setnames(price_data, c("Date", "ICCO daily price (US$/tonne)"), c("Date", "Price"))
+# 转换日期格式
+price_data[, Date := dmy(Date)]
+
+# 读取气象数据
+weather_data <- fread("Ghana_data.csv", sep=",")
+# 转换日期
+weather_data[, DATE := ymd(DATE)]
+# 过滤1994年以后（与价格数据重叠部分）
+weather_data <- weather_data[DATE >= ymd("1994-01-01")]
+
+# 数据清洗与整理
+price_data[, Price := as.numeric(gsub(",", "", Price))]
+# 聚合计算平均温度和总降水
+daily_weather <- weather_data[, .(
+    TAVG = mean(TAVG, na.rm=TRUE),
+    PRCP = mean(PRCP, na.rm=TRUE)
+), by = DATE]
+setnames(daily_weather, "DATE", "Date")
+
+# 处理降水缺失值：缺失视为0
+daily_weather[is.na(PRCP), PRCP := 0]
+# 若温度有缺失，用前后值填充
+daily_weather[, TAVG := na.locf(TAVG, na.rm=FALSE)]
+daily_weather[, TAVG := na.locf(TAVG, fromLast=TRUE)]
+
+# 合并价格与气象数据
+data_merged <- merge(price_data, daily_weather, by="Date", all.x=TRUE)
+# 按日期排序
+setorder(data_merged, Date)
+# 去除气象缺失的行
+data_merged <- data_merged[!is.na(TAVG)]
+
+# 构造特征和目标变量
+# 添加上一日价格特征：lag1Price
+data_merged[, lag1Price := shift(Price, n=1, type="lag")]
+# 添加星期几特征
+data_merged[, Weekday := wday(Date, week_start=1)]  # 1表示周一,7表示周日
+# 将Weekday转为因子
+data_merged[, Weekday := factor(Weekday, levels=1:7)]
+# 构造下一日目标：由于要预测下一日价格，我们将价格列下移一行作为目标
+data_merged[, Price_next := shift(Price, n=-1, type="lead")]
+
+# 删除最后一行（没有下一日目标）
+data_merged <- data_merged[!is.na(Price_next)]
+
+# 准备训练集和测试集索引（Walk-forward 验证）
+train_end_date <- as.Date("2024-07-31")
+initial_train_idx <- which(data_merged$Date <= train_end_date)
+# 提取特征名称
+feature_cols <- c("lag1Price", "TAVG", "PRCP", "Weekday")
+# 将Weekday因子转成哑变量
+
+# 生成哑变量列，移除原始 Weekday 列
+data_merged <- dummy_cols(data_merged, select_columns = "Weekday", remove_selected_columns = TRUE)
+
+# 更新特征列
+dummy_weekday <- names(data_merged)[grep("^Weekday_", names(data_merged))]
+feature_cols <- c("lag1Price", "TAVG", "PRCP", dummy_weekday)
+```
+
+```{r, echo=FALSE}
+# 设置训练集截止日期为 2024-07-31
+train_cutoff_date <- as.Date("2024-07-31")
+initial_train_idx <- which(data_merged$Date <= train_cutoff_date)
+
+# 更新特征列
+dummy_weekday <- names(data_merged)[grep("^Weekday_", names(data_merged))]
+feature_cols <- c("lag1Price", "TAVG", "PRCP", dummy_weekday)
+
+# 初始化保存预测结果的向量
+predictions_daily <- c()
+actuals_daily <- c()
+
+# 按日进行滚动预测：每一步使用之前所有数据训练模型，然后预测当前日的 Price_next
+for(i in seq(max(initial_train_idx) + 1, nrow(data_merged))) {
+    train_idx <- 1:(i - 1)
+    test_idx <- i
+
+    # 构建训练数据和标签
+    train_matrix <- as.matrix(data_merged[train_idx, ..feature_cols])
+    train_label <- data_merged$Price_next[train_idx]
+
+    # 构建测试数据
+    test_matrix <- as.matrix(data_merged[test_idx, ..feature_cols])
+    true_value <- data_merged$Price_next[test_idx]
+
+    # 创建 XGBoost DMatrix
+    dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+    dtest <- xgb.DMatrix(data = test_matrix)
+
+    # 训练 XGBoost 模型
+    model <- xgboost(data = dtrain, objective = "reg:squarederror",
+                     nrounds = 100, max_depth = 5, eta = 0.1, verbose = 0)
+
+    # 预测下一日价格
+    pred_value <- predict(model, dtest)
+
+    # 保存预测结果和真实值
+    predictions_daily <- c(predictions_daily, pred_value)
+    actuals_daily <- c(actuals_daily, true_value)
+}
+
+```
+
+```{r, include=TRUE}
+# Compute MAPE
+mape_daily <- mean(abs((actuals_daily - predictions_daily) / actuals_daily)) * 100
+
+# Compute R-squared
+r2_daily <- 1 - sum((actuals_daily - predictions_daily)^2) / sum((actuals_daily - mean(actuals_daily))^2)
+
+# Output the new evaluation metrics along with RMSE and MAE
+cat(sprintf("Daily Forecast Model: RMSE = %.2f, MAE = %.2f, MAPE = %.2f%%, R-squared = %.2f\n",
+            rmse(actuals_daily, predictions_daily),
+            mae(actuals_daily, predictions_daily),
+            mape_daily,
+            r2_daily))
+```
+
+```{r, echo=FALSE}
+# 为每一行生成月份字段（取每月第一天作为代表）
+data_merged <- copy(data_merged)
+data_merged[, Month := lubridate::floor_date(Date, unit = "month")]
+
+
+# 按月份汇总：取每月的平均 Price, TAVG, PRCP
+monthly_agg <- data_merged[, .(
+  Price = mean(Price, na.rm = TRUE),
+  TAVG  = mean(TAVG, na.rm = TRUE),
+  PRCP  = mean(PRCP, na.rm = TRUE)
+), by = Month]
+
+# 构造滞后特征上一月的 Price
+monthly_agg[, lag1Price := shift(Price, n = 1, type = "lag")]
+
+# 构造目标变量下个月的平均价格
+monthly_agg[, Price_next := shift(Price, n = -1, type = "lead")]
+
+# 删除首尾缺失值
+monthly_agg <- monthly_agg[!is.na(lag1Price) & !is.na(Price_next)]
+
+# 设置训练集：选取月份在 2024-08-01 之前的
+train_cutoff <- as.Date("2024-08-01")
+initial_train_idx_monthly <- which(monthly_agg$Month < train_cutoff)
+
+# 初始化预测结果向量
+predictions_monthly <- c()
+actuals_monthly <- c()
+
+# 仅使用特征：lag1Price, TAVG, PRCP
+for(i in seq(max(initial_train_idx_monthly) + 1, nrow(monthly_agg))) {
+    train_idx <- 1:(i - 1)
+    test_idx <- i
+
+    # 构建训练数据矩阵
+    train_matrix <- as.matrix(monthly_agg[train_idx, .(lag1Price, TAVG, PRCP)])
+    train_label <- monthly_agg$Price_next[train_idx]
+
+    # 构建测试数据矩阵
+    test_matrix <- as.matrix(monthly_agg[test_idx, .(lag1Price, TAVG, PRCP)])
+    true_value <- monthly_agg$Price_next[test_idx]
+
+    # 创建 XGBoost DMatrix
+    dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+    dtest <- xgb.DMatrix(data = test_matrix)
+
+    # 训练 XGBoost 模型
+    model_monthly <- xgboost(data = dtrain, objective = "reg:squarederror",
+                     nrounds = 100, max_depth = 5, eta = 0.1, verbose = 0)
+
+    # 预测下一月平均价格
+    pred_value <- predict(model_monthly, dtest)
+
+    # 保存预测结果和真实值
+    predictions_monthly <- c(predictions_monthly, pred_value)
+    actuals_monthly <- c(actuals_monthly, true_value)
+}
+
+```
+
+```{r, include=TRUE}
+# Compute MAPE for monthly data
+mape_monthly <- mean(abs((actuals_monthly - predictions_monthly) / actuals_monthly)) * 100
+
+# Compute R-squared for monthly data
+r2_monthly <- 1 - sum((actuals_monthly - predictions_monthly)^2) / sum((actuals_monthly - mean(actuals_monthly))^2)
+
+# Output the evaluation metrics for the monthly model
+cat(sprintf("Monthly Forecast Model: RMSE = %.2f, MAE = %.2f, MAPE = %.2f%%, R-squared = %.2f\n",
+            rmse(actuals_monthly, predictions_monthly),
+            mae(actuals_monthly, predictions_monthly),
+            mape_monthly,
+            r2_monthly))
+```
+
+```{r}
+# 提取最后一行的已知数据（即最新月份）
+latest_row <- monthly_agg[.N]
+
+# 创建新的一行预测用数据（未来一个月）
+next_month <- latest_row$Month + months(1)
+
+# 构造特征向量（lag1Price, TAVG, PRCP）
+predict_input <- as.matrix(latest_row[, .(lag1Price = Price, TAVG, PRCP)])
+dpredict <- xgb.DMatrix(data = predict_input)
+
+# 使用上一步训练的 model_monthly 模型进行预测
+predicted_price_next_month <- predict(model_monthly, dpredict)
+
+# 打印预测值
+cat(sprintf("Predicted average cocoa price for %s: %.2f USD/tonne\n",
+            format(next_month, "%B %Y"), predicted_price_next_month))
+
+# 创建一个新的 data.table 包含预测值
+future_row <- data.table(
+  Month = next_month,
+  Price_next = NA,
+  Predicted = predicted_price_next_month
+)
+
+# 准备用于可视化的预测结果（已知部分）
+monthly_agg_pred <- monthly_agg[(max(initial_train_idx_monthly) + 1):.N]
+monthly_agg_pred[, Predicted := predictions_monthly]
+
+# 合并预测的下一个月
+plot_data <- rbind(monthly_agg_pred[, .(Month, Price_next, Predicted)],
+                   future_row)
+
+# 可视化
+ggplot(plot_data, aes(x = Month)) +
+  geom_line(aes(y = Price_next, color = "Actual Average Price"), na.rm = TRUE) +
+  geom_line(aes(y = Predicted, color = "Predicted Average Price"), linetype = "dashed", na.rm = TRUE) +
+  labs(title = "Monthly Cocoa Forecast (including next month prediction)",
+       y = "Average Price", x = "Month", color = "Legend") +
+  theme_minimal()
+
+```
+
+# Literature Review
+
+Forecasting commodity prices traditionally relies on classical
+statistical methods such as ARIMA and SARIMA due to their simplicity and
+interpretability. However, these models assume linear relationships and
+stationary patterns, which often limits their effectiveness when markets
+face volatility, extreme price movements, or non-linear dynamics. Recent
+studies highlight these shortcomings, especially in unpredictable and
+unstable markets.
+
+Chowdary and Sekhar (2024), for example, compared ARIMA and XGBoost in
+stock market forecasting. Their review found that while ARIMA performs
+well with linear, predictable data, its accuracy decreases significantly
+in volatile or irregular market conditions. In contrast, XGBoost,
+utilizing decision trees and gradient boosting, effectively captures
+complex, non-linear patterns that traditional linear models tend to
+overlook.
+
+Similarly, Kızıldağ et al. (2024) studied electricity price forecasting
+and discovered that SARIMA models failed to accurately anticipate sudden
+price spikes, while XGBoost produced considerably lower forecast errors.
+These findings highlight XGBoost’s potential as a more robust method for
+forecasting in volatile, non-linear market environments.
+
+Building upon these insights, our study applies XGBoost to cocoa price
+forecasting, aiming to leverage its capability to handle complex data
+structures and enhance prediction accuracy for a commodity frequently
+affected by market volatility and external shocks.
+
+\newpage
+
+# Methodology
+
+### Data Preprocessing
+
+Our analysis utilizes two primary datasets: daily cocoa prices and
+Ghanaian climate data. Initially, cocoa prices were provided as
+character strings with comma separators (e.g., `"9,099.66"`). These
+values were cleaned using regular expressions to remove formatting
+characters and then converted to numeric format. Date fields, such as
+`“27/02/2025”`, were standardized into consistent date objects.
+
+For the climate data, we extracted daily average temperature (`TAVG`)
+and precipitation (`PRCP`). Since multiple weather stations may record
+on the same date, their values were aggregated using the mean. Missing
+precipitation entries were imputed with zeros under the assumption of no
+rainfall, while temperature gaps were filled using forward and backward
+filling techniques. After cleaning, both datasets were merged by date,
+and additional features were generated—including a one-day lag of the
+cocoa price (`lag1Price`) and dummy variables for each day of the week
+to account for seasonality.
+
+### Data Splitting and Forecasting Strategy
+
+To emulate real-world forecasting conditions and ensure that only past
+data informs predictions, we split the dataset chronologically. All data
+prior to August 20, 2021 (approximately 80% of observations), were used
+for model training. The remaining 20% was reserved for testing.
+
+For daily forecasts, we employed a rolling forecast strategy. The model
+was initially trained on the training set, and for each subsequent day,
+it was re-trained using all prior data to forecast the next day’s price.
+This iterative retraining mimics real-time forecasting scenarios.
+
+In contrast, monthly forecasting involved aggregating daily observations
+into monthly averages. We created lagged features using the previous
+month's average price to predict the following month's value. Only
+complete months prior to August 2021 were included in the training
+phase.
+
+### Modeling Rationale and XGBoost Mechanism
+
+XGBoost (Extreme Gradient Boosting) is a tree-based ensemble learning
+algorithm known for its high predictive accuracy and efficiency. It
+operates within the broader family of boosting algorithms, where models
+are trained sequentially to correct the residual errors of previous
+iterations. Unlike traditional regression models that fit directly to
+the target variable, XGBoost begins with a base prediction—typically the
+mean of the training labels—and iteratively improves its performance by
+adding decision trees that model the residuals.
+
+At each iteration $t$, the model is updated using the formula:
+
+$$
+\hat{y}^{(t)} = \hat{y}^{(t-1)} + \eta f_t(x)
+$$
+
+where $\hat{y}^{(t)}$ is the updated prediction, $f_t(x)$ is the output
+of the new decision tree, and $\eta$ is a learning rate that controls
+how much each new tree contributes.
+
+The objective is to minimize a loss function (e.g., mean squared error)
+using both first-order gradients (to guide the optimization direction)
+and second-order derivatives (to assess curvature), which allows more
+precise control over tree construction. The overall loss function
+includes a regularization term to penalize overly complex models and
+prevent overfitting:
+
+$$
+L(\theta) = \sum_{i=1}^{n} (y_i - \hat{y}_i)^2 + \Omega(f_t)
+$$
+
+XGBoost’s strength lies in its ability to model complex, non-linear
+relationships while maintaining robustness to outliers. It incorporates
+multiple regularization techniques—including maximum tree depth
+(`max_depth`), learning rate (`eta`), subsampling of rows (`subsample`),
+and column sampling (`colsample_bytree`)—to balance flexibility and
+generalization. In this study, the model was configured conservatively
+with:
+
+-   `nrounds = 100`: limiting the number of boosting iterations,\
+-   `max_depth = 5`: to constrain individual tree complexity,\
+-   `eta = 0.1`: to ensure gradual and stable learning.
+
+Although XGBoost is not a time-series-specific model, it performs well
+in forecasting settings when appropriately constructed features are
+used. By incorporating lagged values (e.g., the previous day’s price)
+and external regressors (e.g., temperature, precipitation, and weekday
+indicators), the model effectively captures temporal dependencies and
+nonlinear effects. Its flexibility and adaptability make it particularly
+suitable for predicting commodity prices, such as cocoa, which are
+influenced by both historical trends and external climatic conditions.
+
+\newpage
+
+# Forecasting and Results
+
+Model Training and Validation
+
+The daily forecasting employed a rolling-window approach. Initially,
+data up to August 20, 2021, were used to train the model, covering
+roughly 80% of our observations. Afterward, the model was retrained
+daily using cumulative historical data to predict each subsequent day's
+cocoa price. This approach simulated realistic forecasting conditions.
+Monthly forecasting involved computing monthly averages and creating a
+lagged feature from the previous month's average price. Only complete
+monthly data before August 2021 were utilized for training. Model
+Configuration XGBoost was configured with these specific parameters:
+
+**nrounds = 100:** Sufficient to capture complexity without overfitting.
+
+**max_depth = 5:** Restricts tree complexity, balancing accuracy and
+simplicity.
+
+**eta = 0.1:** A moderate learning rate to ensure stable and incremental
+improvements.
+
+```{r, echo=FALSE}
+# Create a data frame with the evaluation metrics
+evaluation_metrics <- data.frame(
+  Model = c("Daily Forecast Model", "Monthly Forecast Model"),
+  RMSE = c(212.41, 545.52),
+  MAE = c(25.99, 222.51),
+  MAPE = c("0.38%", "3.34%"),
+  R_Squared = c(0.99, 0.93)
+)
+
+kable(evaluation_metrics, "latex", booktabs = TRUE, caption = "Evaluation Metrics for Daily and Monthly Forecast Models") %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+Forecast accuracy was evaluated using four key metrics:
+
+**Root Mean Squared Error (RMSE):** $$
+\text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^{n} (\hat{y}_i - y_i)^2}
+$$
+
+This metric penalizes larger errors more heavily. Our daily model
+achieved an RMSE of 212.41, whereas the monthly model recorded a higher
+RMSE of 545.52, indicating that the daily model produced more precise
+predictions.
+
+**Mean Absolute Error (MAE):** $$
+\text{MAE} = \frac{1}{n} \sum_{i=1}^{n} |\hat{y}_i - y_i|
+$$
+
+MAE is a more interpretable measure of average error. The daily model
+yielded an MAE of 25.99, compared to 222.51 for the monthly model,
+further supporting the superior short-term accuracy of the daily
+approach.
+
+**Mean Absolute Percentage Error (MAPE):** $$
+\text{MAPE} = \frac{100\%}{n} \sum_{i=1}^n \left| \frac{\hat{y}_i - y_i}{y_i} \right|
+$$ The MAPE of the daily forecast was only 0.38%, while the monthly
+forecast’s MAPE reached 3.34%. This indicates that the relative error in
+daily predictions was considerably lower, reaffirming the model’s
+effectiveness at finer time resolutions.
+
+**R-squared (R²):** $$
+R^2 = 1 - \frac{\sum (y_i - \hat{y}_i)^2}{\sum (y_i - \bar{y})^2}
+$$ R² represents the proportion of variance explained by the model. The
+daily model achieved an R² of 0.99, suggesting near-perfect fit, while
+the monthly model had an R² of 0.93, indicating a slightly reduced but
+still strong explanatory power. Together, these metrics show that the
+daily XGBoost model not only delivers more accurate absolute predictions
+but also provides better relative performance and explanatory strength
+compared to its monthly counterpart.
+
+Visual inspection revealed daily forecasts closely tracked actual prices
+during stable periods but lagged in responding to sudden price shifts.
+Monthly forecasts were smoother but missed significant short-term
+fluctuations. Several plots illustrated forecasting performance:
+
+```{r, echo=FALSE}
+test_dates <- data_merged$Date[(max(initial_train_idx) + 1):nrow(data_merged)]
+results_df <- data.frame(Date = test_dates,
+                         Actual = actuals_daily,
+                         Predicted = predictions_daily)
+
+ggplot(results_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = Predicted, color = "Predicted"), linetype = "dashed", linewidth = 1) +
+  labs(title = "Daily Cocoa Price Forecast: Actual vs. Predicted",
+       x = "Date", y = "Cocoa Price (USD/tonne)",
+       color = "Legend") +
+  theme_minimal() +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+```
+
+*Figure 1: Daily Forecast Plot*
+
+Figure 1 illustrates the daily cocoa price forecasts over the test
+period. The solid blue line represents the actual daily cocoa prices,
+while the dashed red line shows the predicted prices generated by our
+XGBoost model. As evident from the plot, during stable market
+conditions, the predicted values closely align with the actual prices.
+
+```{r, echo=FALSE}
+## This part of the code is replaced by the one above that contains an additional month of predicted results
+# Visualize Monthly Forecast Results
+#monthly_agg_pred <- monthly_agg[(max(initial_train_idx_monthly) + 1):.N]
+#monthly_agg_pred[, Predicted := predictions_monthly]
+#ggplot(monthly_agg_pred, aes(x = Month)) + 
+#  geom_line(aes(y = Price_next, color = "Actual Average Price")) +
+#  geom_line(aes(y = Predicted, color = "Predicted Average Price"), linetype = "dashed") +
+#  labs(title = "Monthly Forecast: Actual vs. Predicted Average Cocoa Price",
+#       y = "Average Price", color = "Legend") +
+#  theme_minimal()
+```
+
+*Figure 2: Monthly Forecast Plot*
+
+Figure 2 presents the monthly forecast comparison, where daily data has
+been aggregated into monthly averages. The solid line depicts the actual
+average cocoa price for each month, and the dashed line represents the
+model’s predictions. Although the monthly forecast appears smoother due
+to the aggregation process—which helps to reduce high-frequency noise—it
+also fails to capture abrupt intra-month fluctuations. The larger
+deviations observed in this plot, as compared to the daily forecasts,
+indicate that while monthly averaging can help stabilize the forecast,
+it may also obscure important short-term variations that are crucial for
+accurate predictions in volatile markets.
+
+### Summary
+
+Our XGBoost model effectively captured daily cocoa price dynamics, as
+shown by the low daily forecast errors. While the XGBoost models
+delivered high accuracy in both daily and monthly forecasts—with strong
+alignment to actual price trends and excellent performance on evaluation
+metrics like RMSE, MAE, and R²—it is important to acknowledge a key
+limitation of the method in the context of time series forecasting:
+XGBoost is inherently designed to predict one step ahead.
+
+That is, in the daily model, the forecast targets the next day’s price;
+in the monthly model, it forecasts the following month’s average. The
+model requires past observations as input features (e.g., lagged price,
+temperature, and rainfall), and therefore cannot autonomously generate
+multi-step forecasts without some form of iterative retraining or
+simulated rollout.
+
+This constraint arises because XGBoost is not a sequential or
+autoregressive model like ARIMA that naturally incorporates recursive
+structure across multiple time steps. Instead, it is a supervised
+machine learning algorithm trained to learn mappings between current
+feature states and the immediate next target value. Attempting to use
+its own predictions as inputs for further steps (i.e., multi-step
+recursive forecasting) introduces compounding errors and undermines the
+model’s reliability beyond the first step.
+
+In short, XGBoost achieves high precision, but in a stepwise manner. It
+excels at capturing short-term dynamics and complex relationships in
+historical data, yet its forecast horizon is intrinsically limited to
+one period ahead unless additional techniques—such as feature
+reengineering, multi-output modeling, or hybrid architectures—are
+employed. In practical terms, this means that for strategic planning
+involving longer time horizons, XGBoost may need to be combined with
+other modeling strategies or carefully adapted.
+
+\newpage
+
+# Discussion and Conclusion
+
+The evaluation results highlight both the strengths and limitations of
+using XGBoost for cocoa price forecasting. The daily model delivered
+strong predictive accuracy, with an RMSE of 212.41, MAE of 25.99, MAPE
+of just 0.38%, and an R² of 0.99. These figures reflect the model’s
+ability to capture short-term price dynamics with high precision.
+However, this precision comes with a trade-off: the daily model is
+fundamentally designed to predict only the next day’s value, relying
+entirely on lagged features from the most recent data point.
+
+The monthly model, by contrast, enables forecasting one full month
+ahead. While it achieved reasonably good performance (R² = 0.93), its
+RMSE of 545.52 and MAPE of 3.34% were significantly higher than the
+daily model. This reflects the challenge of predicting average outcomes
+over longer periods, where intra-month volatility is smoothed out—making
+the model less responsive to abrupt changes. The forecasted next-month
+value, though consistent with recent trends, must be interpreted
+cautiously due to this loss of detail.
+
+These observations echo findings from the literature. Studies by
+Chowdary and Sekhar (2024) and Kızıldağ et al. (2024) underscore
+XGBoost’s strength in modeling complex, non-linear patterns, especially
+in volatile markets. Yet, they also note that its performance is often
+constrained by its one-step-ahead architecture and limited temporal
+foresight unless extended with recursive or hybrid strategies.
+
+Future improvements could involve experimenting with multi-step
+frameworks, enriching the feature set with external economic indicators,
+or integrating classical models to build hybrid solutions that leverage
+the strengths of both interpretability and flexibility.
+
+\newpage
+
+# References
+
+Chowdary, A., & Sekhar, C. (2024). ARIMA and XGBoost stock market
+forecasting: A review. *International Journal of Scientific Research &
+Engineering Trends, 10*(1), 42–49.
+
+Kızıldağ, M., Güler, C., Şahin, A., & Durmuşoğlu, M. B. (2024).
+Development of new electricity system marginal price forecasting models
+using statistical and artificial intelligence methods. *Applied
+Sciences, 14*(1), 500. <https://doi.org/10.3390/app14010500>
