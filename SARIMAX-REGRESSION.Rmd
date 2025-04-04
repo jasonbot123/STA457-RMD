@@ -1,29 +1,213 @@
 ---
-title: "SARIMAX-REGRESSION"
-output: pdf_document
-date: "2025-04-04"
+title: ""
+author: ""
+date: ""
+output:
+  pdf_document:
+    number_sections: true
+    toc: false
+    latex_engine: xelatex
+fontsize: 12pt
+geometry: margin=1in
 ---
 
+\begin{center}
+\vspace*{3cm}
+
+{\LARGE \textbf{STA457 Final Project}}\\[2em]
+
+{\Large Forecasting Cocoa Prices: From SARIMAX to Linear Regression}\\[4em]
+
+\textbf{Authors:}\\
+Quansheng (George) Guo\\
+Xing Li\\
+Jason Zhi Cheng Yang\\[3em]
+
+University of Toronto\\[2em]
+
+\textbf{Date:} \today
+
+\vfill
+\end{center}
+
+\newpage
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", out.width = "70%")
 ```
 
-## R Markdown
+```{r, echo=FALSE}
+### SARIMAX 
+# Load required libraries
+library(dplyr)
+library(lubridate)
+library(forecast)  
+library(ggplot2)
+library(tidyverse)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+### Load and Aggregate Cocoa Price Data
+cocoa_prices <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    Date = as.Date(Date, format = "%d/%m/%Y"),
+    Price = as.numeric(gsub(",", "", ICCO.daily.price..US..tonne.))
+  ) %>%
+  select(Date, Price) %>%
+  arrange(Date) %>%
+  # Aggregate to monthly (mean price)
+  mutate(Month = floor_date(Date, "month")) %>%
+  group_by(Month) %>%
+  summarise(Price = mean(Price, na.rm = TRUE)) %>%
+  rename(Date = Month)
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+### Load and Aggregate Ghana Weather Data
+ghana_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE) %>%
+  mutate(DATE = as.Date(DATE)) %>%
+  # Aggregate to monthly (sum for PRCP, mean for temps)
+  mutate(Month = floor_date(DATE, "month")) %>%
+  group_by(Month) %>%
+  summarise(
+    PRCP = sum(PRCP, na.rm = TRUE),
+    TAVG = mean(TAVG, na.rm = TRUE),
+    TMAX = mean(TMAX, na.rm = TRUE),
+    TMIN = mean(TMIN, na.rm = TRUE)
+  ) %>%
+  rename(Date = Month)
 
-```{r cars}
-summary(cars)
+cocoa_data <- left_join(cocoa_prices, ghana_weather, by = "Date") %>%
+  mutate(log_price = log(Price)) %>%  # SARIMAX will handle differencing internally
+  drop_na()
+
+# Split into train/test (80/20)
+train_size <- floor(0.8 * nrow(cocoa_data))
+train_data <- cocoa_data[1:train_size, ]
+test_data <- cocoa_data[(train_size + 1):nrow(cocoa_data), ]
+
+# Convert target variable to time series object (monthly frequency = 12)
+train_ts <- ts(train_data$log_price, frequency = 12)
+
+# Exogenous variables (weather data)
+xreg_train <- train_data %>% select(PRCP, TAVG, TMAX, TMIN) %>% as.matrix()
+xreg_test <- test_data %>% select(PRCP, TAVG, TMAX, TMIN) %>% as.matrix()
+
+# Let auto.arima() find optimal (p,d,q)(P,D,Q) with exogenous variables
+sarimax_model <- auto.arima(
+  train_ts,
+  xreg = xreg_train,
+  seasonal = TRUE,
+  stepwise = FALSE,  # More thorough search (set to TRUE for faster results)
+  approximation = FALSE,
+  trace = TRUE  # Show model search progress
+)
+
+
+sarimax_forecast <- forecast(
+  sarimax_model,
+  xreg = xreg_test,
+  h = nrow(test_data)  # Forecast horizon = test set size
+)
+
+predicted_log <- sarimax_forecast$mean
+predicted_price <- exp(predicted_log)
+actual_price <- exp(test_data$log_price)
+
+results <- data.frame(
+  Date = test_data$Date,
+  Actual = actual_price,
+  Predicted = predicted_price
+)
+
+# Plot results
+ggplot(results, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "red", linewidth = 1) +
+  geom_line(aes(y = Predicted), color = "blue", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Monthly Cocoa Price SARIMAX Forecast",
+    subtitle = paste("Model:", sarimax_model$arma),
+    y = "Price (US$/tonne)",
+    x = "Date"
+  ) +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b", date_breaks = "3 months")
+
+```
+```{r, echo=FALSE}
+### Monthly
+### Load and Aggregate Cocoa Price Data
+cocoa_prices <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    Date = as.Date(Date, format = "%d/%m/%Y"),
+    Price = as.numeric(gsub(",", "", ICCO.daily.price..US..tonne.))
+  ) %>%
+  select(Date, Price) %>%
+  arrange(Date) %>%
+  # Aggregate to monthly (mean price)
+  mutate(Month = floor_date(Date, "month")) %>%
+  group_by(Month) %>%
+  summarise(Price = mean(Price, na.rm = TRUE)) %>%
+  rename(Date = Month)
+
+### Load and Aggregate Ghana Weather Data
+ghana_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE) %>%
+  mutate(DATE = as.Date(DATE)) %>%
+  # Aggregate to monthly (sum for PRCP, mean for temps)
+  mutate(Month = floor_date(DATE, "month")) %>%
+  group_by(Month) %>%
+  summarise(
+    PRCP = sum(PRCP, na.rm = TRUE),
+    TAVG = mean(TAVG, na.rm = TRUE),
+    TMAX = mean(TMAX, na.rm = TRUE),
+    TMIN = mean(TMIN, na.rm = TRUE)
+  ) %>%
+  rename(Date = Month)
+
+cocoa_data <- left_join(cocoa_prices, ghana_weather, by = "Date") %>%
+  mutate(
+    log_price = log(Price),
+    diff_log_price = c(NA, diff(log_price))
+  ) %>%
+  drop_na()
+
+create_monthly_lags <- function(data, lags = 1:2) {
+  for (lag in lags) {
+    data[[paste0("lag_", lag)]] <- dplyr::lag(data$log_price, lag)
+  }
+  return(data)
+}
+
+cocoa_data_lagged <- create_monthly_lags(cocoa_data) %>% 
+  drop_na()
+
+lm_data <- cocoa_data_lagged %>%
+  select(Date, log_price, starts_with("lag_"), PRCP, TAVG, TMAX, TMIN) %>%
+  drop_na()
+
+# Split into train/test (80/20)
+train_size <- floor(0.8 * nrow(lm_data))
+train_lm <- lm_data[1:train_size, ]
+test_lm <- lm_data[(train_size + 1):nrow(lm_data), ]
+
+lm_model <- lm(log_price ~ . - Date, data = train_lm)
+lm_pred_log <- predict(lm_model, newdata = test_lm)
+lm_pred_price <- exp(lm_pred_log)  # Convert back to original scale
+
+lm_results <- tibble(
+  Date = test_lm$Date,
+  Actual = exp(test_lm$log_price),
+  Predicted = lm_pred_price
+)
+
+# Plot monthly predictions
+ggplot(lm_results, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "red", linewidth = 1) +
+  geom_line(aes(y = Predicted), color = "blue", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Monthly Cocoa Price Predictions vs Actuals",
+    subtitle = "Linear Regression with Weather and Lag Features",
+    y = "Price (US$/tonne)",
+    x = "Date"
+  ) +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b", date_breaks = "3 months")
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
