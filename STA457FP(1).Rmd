@@ -1,6 +1,6 @@
 ---
 title: "STA457FP"
-author: "Quansheng (George) Guo"
+author: "Quansheng (George) Guo, Jason Zhi Cheng Yang, Xing Li"
 date: "2025-03-28"
 output: 
   pdf_document:
