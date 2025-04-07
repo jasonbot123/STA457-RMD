@@ -1,4 +1,4 @@
-# STA457-Forecasting Cocoa Prices: From ARIMAX-GARCHX to XGBoost
+# STA457-Forecasting Cocoa Prices
 
 Authors: Xing Li (1008903117), Quansheng (George) Guo (1008282564), and Jason Zhi Cheng Yang (1008783461).
 
